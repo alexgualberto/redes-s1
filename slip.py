@@ -1,106 +1,88 @@
-from iputils import *
-import ipaddress
+class CamadaEnlace:
+    ignore_checksum = False
 
-class CIDR:
-    def __init__(self, cidr):
-        self.address, self.n = tuple(cidr.split('/'))
-        self.n = int(self.n)
-        self.prefix = int.from_bytes(str2addr(self.address), 'big') >> 32 - self.n
-
-class IP:
-    def __init__(self, enlace):
+    def __init__(self, linhas_seriais):
         """
-        Inicia a camada de rede. Recebe como argumento uma implementação
-        de camada de enlace capaz de localizar os next_hop (por exemplo,
-        Ethernet com ARP).
+        Inicia uma camada de enlace com um ou mais enlaces, cada um conectado
+        a uma linha serial distinta. O argumento linhas_seriais é um dicionário
+        no formato {ip_outra_ponta: linha_serial}. O ip_outra_ponta é o IP do
+        host ou roteador que se encontra na outra ponta do enlace, escrito como
+        uma string no formato 'x.y.z.w'. A linha_serial é um objeto da classe
+        PTY (vide camadafisica.py) ou de outra classe que implemente os métodos
+        registrar_recebedor e enviar.
         """
+        self.enlaces = {}
         self.callback = None
-        self.enlace = enlace
-        self.enlace.registrar_recebedor(self.__raw_recv)
-        self.ignore_checksum = self.enlace.ignore_checksum
-        self.meu_endereco = None
-        self.id = 0
-
-    def __raw_recv(self, datagrama):
-        dscp, ecn, identification, flags, frag_offset, ttl, proto, \
-           src_addr, dst_addr, payload = read_ipv4_header(datagrama)
-        if dst_addr == self.meu_endereco:
-            if proto == IPPROTO_TCP and self.callback:
-                self.callback(src_addr, dst_addr, payload)
-        else:
-            next_hop = self._next_hop(dst_addr)
-            ttl -= 1
-            if (ttl == 0):
-                checksum = calc_checksum(struct.pack('>BBHI', 11, 0, 0, 0) + datagrama[:28])
-                self.enviar((struct.pack('>BBHI', 11, 0, 0, checksum) + datagrama[:28]), src_addr, 1)
-                return
-
-            cabecalho = struct.pack('>BBHHHBBH', 0x45, dscp | ecn, (20 + len(payload)), identification,  (flags << 13) | frag_offset, ttl, proto, 0)
-            cabecalho += str2addr(src_addr) +str2addr(dst_addr)
-
-            cabecalho_final = struct.pack('>BBHHHBBH', 0x45, 0, (20 + len(payload)), identification,  (flags << 13) | frag_offset, ttl, proto, calc_checksum(cabecalho))
-
-            cabecalho_final += str2addr(src_addr) +str2addr(dst_addr)
-
-            datagrama = cabecalho_final + payload
-
-            self.enlace.enviar(datagrama, next_hop)
-
-    def _next_hop(self, dest_addr):
-        next_hop = None
-        max_n = -1
-        for cidr in self.tabela:
-            if int.from_bytes(str2addr(dest_addr), 'big') >> 32 - cidr.n == cidr.prefix:
-                if cidr.n > max_n:
-                    next_hop = self.tabela[cidr]
-                    max_n = cidr.n
-        return next_hop
-
-
-    def definir_endereco_host(self, meu_endereco):
-        """
-        Define qual o endereço IPv4 (string no formato x.y.z.w) deste host.
-        Se recebermos datagramas destinados a outros endereços em vez desse,
-        atuaremos como roteador em vez de atuar como host.
-        """
-        self.meu_endereco = meu_endereco
-
-    def definir_tabela_encaminhamento(self, tabela):
-        """
-        Define a tabela de encaminhamento no formato
-        [(cidr0, next_hop0), (cidr1, next_hop1), ...]
-
-        Onde os CIDR são fornecidos no formato 'x.y.z.w/n', e os
-        next_hop são fornecidos no formato 'x.y.z.w'.
-        """
-        self.tabela = {}
-        for x in tabela:
-            cidr, next_hop = x
-            self.tabela[CIDR(cidr)] = next_hop
-
+        # Constrói um Enlace para cada linha serial
+        for ip_outra_ponta, linha_serial in linhas_seriais.items():
+            enlace = Enlace(linha_serial)
+            self.enlaces[ip_outra_ponta] = enlace
+            enlace.registrar_recebedor(self._callback)
 
     def registrar_recebedor(self, callback):
         """
-        Registra uma função para ser chamada quando dados vierem da camada de rede
+        Registra uma função para ser chamada quando dados vierem da camada de enlace
         """
         self.callback = callback
 
-    def enviar(self, segmento, dest_addr, protocolo = 6):
+    def enviar(self, datagrama, next_hop):
         """
-        Envia segmento para dest_addr, onde dest_addr é um endereço IPv4
-        (string no formato x.y.z.w).
+        Envia datagrama para next_hop, onde next_hop é um endereço IPv4
+        fornecido como string (no formato x.y.z.w). A camada de enlace se
+        responsabilizará por encontrar em qual enlace se encontra o next_hop.
         """
-        next_hop = self._next_hop(dest_addr)
+        # Encontra o Enlace capaz de alcançar next_hop e envia por ele
+        self.enlaces[next_hop].enviar(datagrama)
 
-        cabecalho = struct.pack('>BBHHHBBH', 0x45, 0, (20 + len(segmento)), self.id,  0, 64, protocolo, 0)
-        cabecalho += str2addr(self.meu_endereco) +str2addr(dest_addr)
+    def _callback(self, datagrama):
+        if self.callback:
+            self.callback(datagrama)
 
-        cabecalho_final = struct.pack('>BBHHHBBH', 0x45, 0, (20 + len(segmento)), self.id,  0, 64, protocolo, calc_checksum(cabecalho))
 
-        cabecalho_final += str2addr(self.meu_endereco) +str2addr(dest_addr)
+class Enlace:
+    def __init__(self, linha_serial):
+        self.linha_serial = linha_serial
+        self.linha_serial.registrar_recebedor(self.__raw_recv)
+        self.dados_residuais = b''
+	
+    def registrar_recebedor(self, callback):
+        self.callback = callback
 
-        self.id += 1
+    def enviar(self, datagrama):
+        # TODO: Preencha aqui com o código para enviar o datagrama pela linha
+        # serial, fazendo corretamente a delimitação de quadros e o escape de
+        # sequências especiais, de acordo com o protocolo CamadaEnlace (RFC 1055).
+        datagrama = datagrama.replace(b'\xdb', b'\xdb\xdd')
+        datagrama = datagrama.replace(b'\xc0', b'\xdb\xdc')
+        self.linha_serial.enviar(b'\xc0' + datagrama + b'\xc0')
+        pass
 
-        datagrama = cabecalho_final + segmento
+    def __raw_recv(self, dados):
+        # TODO: Preencha aqui com o código para receber dados da linha serial.
+        # Trate corretamente as sequências de escape. Quando ler um quadro
+        # completo, repasse o datagrama contido nesse quadro para a camada
+        # superior chamando self.callback. Cuidado pois o argumento dados pode
+        # vir quebrado de várias formas diferentes - por exemplo, podem vir
+        # apenas pedaços de um quadro, ou um pedaço de quadro seguido de um
+        # pedaço de outro, ou vários quadros de uma vez só.
+        dados = self.dados_residuais + dados
+        
+        self.dados_residuais = b''
+        
+        if not dados.endswith(b'\xc0'):
+            dados = dados.split(b'\xc0')
+            dados = list(filter((b'').__ne__, dados))
+            self.dados_residuais += dados.pop(-1)
+        else:
+            dados = dados.split(b'\xc0')
+            dados = list(filter((b'').__ne__, dados))
+		
+        for datagrama in dados:
+            datagrama = datagrama.replace(b'\xdb\xdc', b'\xc0')
+            datagrama = datagrama.replace(b'\xdb\xdd', b'\xdb') 
 
-        self.enlace.enviar(datagrama, next_hop)
+            try:
+                self.callback(datagrama)
+            except:
+                import traceback
+                traceback.print_exc()
